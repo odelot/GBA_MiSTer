@@ -635,7 +635,10 @@ gba
    .largeimg_singlebuf(FB_LL),
 
 	.sound_out_left(GBA_AUDIO_L),
-	.sound_out_right(GBA_AUDIO_R)
+	.sound_out_right(GBA_AUDIO_R),
+
+	.ra_iwram_addr(ra_iwram_addr),
+	.ra_iwram_data(ra_iwram_data)
 );
 
 assign AUDIO_L = (fast_forward && status[19]) ? 16'd0 : GBA_AUDIO_L;
@@ -856,8 +859,36 @@ ddram ddram
    .ch5_addr({fb_addr, 1'b0}),
    .ch5_din(gamma_en ? fb_gamma_din : fb_din),
    .ch5_req(fb_ddr3_req),
-   .ch5_ready(fb_ack)
-   
+   .ch5_ready(fb_ack),
+
+   .ra_addr(ra_ddram_addr),
+   .ra_din(ra_ddram_din),
+   .ra_be(ra_ddram_be),
+   .ra_we(ra_ddram_we),
+   .ra_req(ra_ddram_req),
+   .ra_ack(ra_ddram_ack),
+   .ra_dout(ra_ddram_dout)
+);
+
+// RetroAchievements RAM mirror
+ra_ram_mirror_gba ra_mirror(
+        .clk(clk_sys),
+        .reset(reset),
+        .vblank(vsync),
+
+        .iwram_addr(ra_iwram_addr),
+        .iwram_dout(ra_iwram_data),
+
+        .ddram_addr(ra_ddram_addr),
+        .ddram_din(ra_ddram_din),
+        .ddram_be(ra_ddram_be),
+        .ddram_we(ra_ddram_we),
+        .ddram_req(ra_ddram_req),
+        .ddram_ack(ra_ddram_ack),
+        .ddram_dout(ra_ddram_dout),
+
+        .active(ra_active),
+        .dbg_frame_counter(ra_dbg_frame_counter)
 );
 
 // gamma for 2x rendering
@@ -1464,5 +1495,18 @@ always_ff @(posedge clk_sys) begin
 		endcase
 	end
 end
+
+// RetroAchievements RAM mirror signals
+wire [14:0] ra_iwram_addr;
+wire  [7:0] ra_iwram_data;
+wire [24:0] ra_ddram_addr;
+wire [63:0] ra_ddram_din;
+wire  [7:0] ra_ddram_be;
+wire        ra_ddram_we;
+wire        ra_ddram_req;
+wire        ra_ddram_ack;
+wire [63:0] ra_ddram_dout;
+wire        ra_active;
+wire [31:0] ra_dbg_frame_counter;
 
 endmodule

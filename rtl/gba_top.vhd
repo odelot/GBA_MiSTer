@@ -137,7 +137,10 @@ entity gba_top is
       debug_cpu_mixed       : out    std_logic_vector(31 downto 0);
       debug_irq             : out    std_logic_vector(31 downto 0);
       debug_dma             : out    std_logic_vector(31 downto 0);
-      debug_mem             : out    std_logic_vector(31 downto 0)  
+      debug_mem             : out    std_logic_vector(31 downto 0);
+      -- RetroAchievements IWRAM read port
+      ra_iwram_addr         : in     std_logic_vector(14 downto 0) := (others => '0');
+      ra_iwram_data         : out    std_logic_vector(7 downto 0)  
    );
 end entity;
 
@@ -737,7 +740,9 @@ begin
       AnalogTiltX          => AnalogTiltX,
       AnalogTiltY          => AnalogTiltY,
 
-      debug_mem            => debug_mem      
+      debug_mem            => debug_mem,
+      ra_iwram_addr        => ra_iwram_addr,
+      ra_iwram_data        => ra_iwram_data
    );
    
    igba_dma : entity work.gba_dma

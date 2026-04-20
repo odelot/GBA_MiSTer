@@ -67,7 +67,16 @@ module ddram
 	input  [27:1] ch5_addr,
 	input  [63:0] ch5_din,
 	input         ch5_req,
-	output        ch5_ready
+	output        ch5_ready,
+
+	// RetroAchievements: toggle-based write+read (lowest priority)
+	input  [24:0] ra_addr,
+	input  [63:0] ra_din,
+	input   [7:0] ra_be,
+	input         ra_we,
+	input         ra_req,
+	output reg    ra_ack,
+	output [63:0] ra_dout
 );
 
 reg  [7:0] ram_burst;
@@ -79,6 +88,7 @@ reg        ram_write = 0;
 reg  [7:0] ram_be;
 
 reg  [5:1] ready;
+reg        ra_rd_pending = 0;
 
 assign DDRAM_BURSTCNT = ram_burst;
 assign DDRAM_BE       = ram_read ? 8'hFF : ram_be;
@@ -96,6 +106,7 @@ assign ch2_ready = ready[2];
 assign ch3_ready = ready[3];
 assign ch4_ready = ready[4];
 assign ch5_ready = ready[5];
+assign ra_dout   = ram_q[1];
 
 reg [63:0] next_q[2:1];
 reg [27:1] cache_addr[2:1];
@@ -226,11 +237,35 @@ always @(posedge DDRAM_CLK) begin
                ram_burst        <= 1;
                ready[5]         <= 1;
 				end
+			   else if(ra_req != ra_ack) begin
+					if (ra_we) begin
+						ram_address   <= {ra_addr, 2'b00};
+						ram_data      <= ra_din;
+						ram_be        <= ra_be;
+						ram_write     <= 1;
+						ram_burst     <= 1;
+						ra_ack        <= ra_req;
+					end else begin
+						ch            <= 1;
+						ram_address   <= {ra_addr, 2'b00};
+						ram_read      <= 1;
+						ram_burst     <= 1;
+						ra_rd_pending <= 1;
+						cached[1]     <= 0;
+						state         <= 1;
+					end
+				end
 
 			1: if(DDRAM_DOUT_READY) begin
 					ram_q[ch]        <= DDRAM_DOUT;
-					ready[ch]        <= 1;
-					state            <= {ram_burst[1], 1'b0};
+					if (ra_rd_pending) begin
+						ra_ack        <= ra_req;
+						ra_rd_pending <= 0;
+						state         <= 0;
+					end else begin
+						ready[ch]     <= 1;
+						state         <= {ram_burst[1], 1'b0};
+					end
 				end
 
 			2: if(DDRAM_DOUT_READY) begin
