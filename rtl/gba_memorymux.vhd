@@ -116,6 +116,10 @@ entity gba_memorymux is
       AnalogTiltX          : in     signed(7 downto 0);
       AnalogTiltY          : in     signed(7 downto 0);
       
+      -- RetroAchievements IWRAM read port (via BRAM port B)
+      ra_iwram_addr        : in     std_logic_vector(14 downto 0) := (others => '0');
+      ra_iwram_data        : out    std_logic_vector(7 downto 0);
+      
       debug_mem            : out    std_logic_vector(31 downto 0)  
    );
 end entity;
@@ -182,6 +186,8 @@ architecture arch of gba_memorymux is
    signal smallram_addr_w    : integer range 0 to 8191 := 0;
    signal smallram_DataOut   : std_logic_vector(31 downto 0) := (others => '0');
    signal smallram_we        : std_logic_vector(0 to 3) := (others => '0');
+   signal ra_iwram_addr_int  : integer range 0 to 8191 := 0;
+   signal ra_iwram_dout      : std_logic_vector(31 downto 0);
                              
    signal read_operation     : std_logic := '0';
                              
@@ -279,7 +285,11 @@ begin
    gsmallram : for i in 0 to 3 generate
       signal smallram_dout_single : std_logic_vector(7 downto 0);
       signal smallram_din_single  : std_logic_vector(7 downto 0);
+      signal smallram_dout_b      : std_logic_vector(7 downto 0);
+      signal smallram_addr_b_mux  : integer;
    begin
+      smallram_addr_b_mux <= ra_iwram_addr_int when (smallram_we = "0000") else smallram_addr_w;
+
       ismallram: entity MEM.SyncRamDual
       generic map
       (
@@ -296,18 +306,29 @@ begin
          we_a       => '0',
          re_a       => '1',
                   
-         addr_b     => smallram_addr_w,
+         addr_b     => smallram_addr_b_mux,
          datain_b   => smallram_din_single,
-         dataout_b  => open,
+         dataout_b  => smallram_dout_b,
          we_b       => smallram_we(i),
-         re_b       => '0' 
+         re_b       => '1' 
       );
       
       smallram_din_single <= rotate_writedata(((i+1) * 8) - 1 downto (i * 8));
       smallram_DataOut(((i+1) * 8) - 1 downto (i * 8)) <= smallram_dout_single;
+      ra_iwram_dout(((i+1) * 8) - 1 downto (i * 8)) <= smallram_dout_b;
    end generate;
    
    smallram_addr_r <= to_integer(unsigned(mem_bus_Adr(14 downto 2)));
+   
+   -- RetroAchievements: convert byte address to word address for BRAM port B
+   ra_iwram_addr_int <= to_integer(unsigned(ra_iwram_addr(14 downto 2)));
+   
+   -- Byte select from 32-bit BRAM output
+   with ra_iwram_addr(1 downto 0) select
+      ra_iwram_data <= ra_iwram_dout( 7 downto  0) when "00",
+                       ra_iwram_dout(15 downto  8) when "01",
+                       ra_iwram_dout(23 downto 16) when "10",
+                       ra_iwram_dout(31 downto 24) when others;
    
    
    i_gamepak_cache : entity work.cache
