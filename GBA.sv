@@ -233,8 +233,8 @@ parameter CONF_STR = {
 	"GBA;SS3E000000:80000;",
 	"FS,GBA,Load,300C0000;",
 	"-;",
-	"C,Cheats;",
-	"H1O[6],Cheats Enabled,Yes,No;",
+	"H7C,Cheats;",
+	"H7H1O[6],Cheats Enabled,Yes,No;",
 	"-;",
 	"D0R[12],Reload Backup RAM;",
 	"D0R[13],Save Backup RAM;",
@@ -244,7 +244,7 @@ parameter CONF_STR = {
 	"O[43],Autoincrement Slot,Off,On;",
 	"O[38:37],Savestate Slot,1,2,3,4;",
 	"h4H3R[17],Save state (Alt-F1);",
-	"h4H3R[18],Restore state (F1);",
+	"H7h4H3R[18],Restore state (F1);",
 	"-;",
 	"P1,Video & Audio;",
 	"P1-;",
@@ -302,7 +302,8 @@ parameter CONF_STR = {
 
 wire  [1:0] buttons;
 wire [63:0] status;
-wire [15:0] status_menumask = {~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, ~gg_active, ~bk_ena};
+wire        hardcore = status[44];
+wire [15:0] status_menumask = {hardcore, ~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, (~gg_active | hardcore), ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
 reg         sd_rd = 0;
@@ -443,28 +444,42 @@ wire [7:0] ss_info;
 wire ss_save, ss_load, ss_info_req;
 wire statusUpdate;
 
+// Block F1-F4 (load) keyboard shortcuts in hardcore; allow Alt+F1-F4 (save)
+wire skip_ps2_fkey = (ps2_key[7:0] == 'h05) || (ps2_key[7:0] == 'h06) ||
+                     (ps2_key[7:0] == 'h04) || (ps2_key[7:0] == 'h0C);
+reg kbd_alt = 1'b0;
+reg kbd_strobe_old = 1'b0;
+always @(posedge clk_sys) begin
+	kbd_strobe_old <= ps2_key[10];
+	if (kbd_strobe_old != ps2_key[10] && ps2_key[7:0] == 'h11)
+		kbd_alt <= ps2_key[9];
+end
+wire block_load_kbd = skip_ps2_fkey && hardcore && !kbd_alt;
+wire [10:0] ps2_key_adjust = block_load_kbd ? 11'h0 : ps2_key[10:0];
+
 savestate_ui savestate_ui
 (
-	.clk            (clk_sys       ),
-	.ps2_key        (ps2_key[10:0] ),
-	.allow_ss       (cart_loaded   ),
-	.joySS          (joy_unmod[12] ),
-	.joyRight       (joy_unmod[0]  ),
-	.joyLeft        (joy_unmod[1]  ),
-	.joyDown        (joy_unmod[2]  ),
-	.joyUp          (joy_unmod[3]  ),
-	.joyStart       (joy_unmod[9]  ),
-	.joyRewind      (joy_unmod[11] ),
-	.rewindEnable   (status[27]    ),
-	.status_slot    (status[38:37] ),
-	.autoincslot    (status[43]    ),
-	.OSD_saveload   (status[18:17] ),
-	.ss_save        (ss_save       ),
-	.ss_load        (ss_load       ),
-	.ss_info_req    (ss_info_req   ),
-	.ss_info        (ss_info       ),
-	.statusUpdate   (statusUpdate  ),
-	.selected_slot  (ss_slot       )
+	.clk            (clk_sys                  ),
+	.ps2_key        (ps2_key_adjust           ),
+	.allow_ss       (cart_loaded & ~hardcore  ),
+	.allow_save     (cart_loaded              ),
+	.joySS          (joy_unmod[12]            ),
+	.joyRight       (joy_unmod[0]             ),
+	.joyLeft        (joy_unmod[1]             ),
+	.joyDown        (joy_unmod[2]             ),
+	.joyUp          (joy_unmod[3]             ),
+	.joyStart       (joy_unmod[9]             ),
+	.joyRewind      (joy_unmod[11]            ),
+	.rewindEnable   (status[27]               ),
+	.status_slot    (status[38:37]            ),
+	.autoincslot    (status[43]               ),
+	.OSD_saveload   (status[18:17]            ),
+	.ss_save        (ss_save                  ),
+	.ss_load        (ss_load                  ),
+	.ss_info_req    (ss_info_req              ),
+	.ss_info        (ss_info                  ),
+	.statusUpdate   (statusUpdate             ),
+	.selected_slot  (ss_slot                  )
 );
 defparam savestate_ui.INFO_TIMEOUT_BITS = 27;
 
@@ -550,7 +565,7 @@ gba
 	.memory_remap(memory_remap_quirk),
    .increaseSSHeaderCount(!status[36]),
    .save_state(ss_save),
-   .load_state(ss_load),
+   .load_state(ss_load & ~hardcore),
    .interframe_blend(status[10:9]),
    .maxpixels(status[20] | sprite_quirk),
    .hdmode2x_bg(status[21]),
@@ -573,7 +588,7 @@ gba
    .RTC_inuse(has_rtc),
 
    .cheat_clear(gg_reset),
-   .cheats_enabled(~status[6]),
+   .cheats_enabled(~status[6] & ~hardcore),
    .cheat_on(gg_valid),
    .cheat_in(gg_code),
    .cheats_active(gg_active),

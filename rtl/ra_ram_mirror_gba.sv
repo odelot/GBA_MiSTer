@@ -152,7 +152,7 @@ dbg_cart_cnt <= 16'd0;
 dbg_first_addr <= 16'd0;
 // Write header with busy=1
 ddram_addr <= DDRAM_BASE[24:0];
-ddram_din  <= {16'd0, 8'h01, 8'd0, 32'h52414348};
+ddram_din  <= {16'h0100, 8'h01, 8'd0, 32'h52414348};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
@@ -371,7 +371,7 @@ end
 // =============================================================
 S_WR_HDR0: begin
 ddram_addr <= DDRAM_BASE[24:0];
-ddram_din  <= {16'd0, 8'h00, 8'd0, 32'h52414348};
+ddram_din  <= {16'h0100, 8'h00, 8'd0, 32'h52414348};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
