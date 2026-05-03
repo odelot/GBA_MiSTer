@@ -54,7 +54,13 @@ module sdram
 	input      [15:0] ch3_din,
 	input             ch3_req,
 	input             ch3_rnw,
-	output reg        ch3_ready
+	output reg        ch3_ready,
+
+	// ch4: RetroAchievements SDRAM read (32-bit, lowest priority, read-only)
+	input      [26:1] ch4_addr,
+	output reg [31:0] ch4_dout,
+	input             ch4_req,
+	output reg        ch4_ready
 );
 
 assign SDRAM_nCS  = chip;
@@ -105,7 +111,7 @@ localparam STATE_RFSH    = 10;
 
 
 always @(posedge clk) begin
-	reg [CAS_LATENCY+BURST_LENGTH:0] data_ready_delay1, data_ready_delay2, data_ready_delay3;
+	reg [CAS_LATENCY+BURST_LENGTH:0] data_ready_delay1, data_ready_delay2, data_ready_delay3, data_ready_delay4;
 
 	reg        saved_wr;
 	reg [12:0] cas_addr;
@@ -113,22 +119,25 @@ always @(posedge clk) begin
 	reg [15:0] dq_reg;
 	reg  [3:0] state = STATE_STARTUP;
 
-	reg       ch1_rq, ch2_rq, ch3_rq;
+	reg       ch1_rq, ch2_rq, ch3_rq, ch4_rq;
 	reg [1:0] ch;
 
 	ch1_rq <= ch1_rq | ch1_req;
 	ch2_rq <= ch2_rq | ch2_req;
 	ch3_rq <= ch3_rq | ch3_req;
+	ch4_rq <= ch4_rq | ch4_req;
 
 	ch1_ready <= 0;
 	ch2_ready <= 0;
 	ch3_ready <= 0;
+	ch4_ready <= 0;
 
 	refresh_count <= refresh_count+1'b1;
 
 	data_ready_delay1 <= data_ready_delay1>>1;
 	data_ready_delay2 <= data_ready_delay2>>1;
 	data_ready_delay3 <= data_ready_delay3>>1;
+	data_ready_delay4 <= data_ready_delay4>>1;
 
 	dq_reg <= SDRAM_DQ;
 
@@ -145,6 +154,10 @@ always @(posedge clk) begin
 	if(data_ready_delay3[3]) ch3_dout[07:00] <= dq_reg[7:0];
 	if(data_ready_delay3[1]) ch3_dout[15:08] <= dq_reg[7:0];
 	if(data_ready_delay3[1]) ch3_ready <= 1;
+
+	if(data_ready_delay4[3]) ch4_dout[15:00] <= dq_reg;
+	if(data_ready_delay4[2]) ch4_dout[31:16] <= dq_reg;
+	if(data_ready_delay4[2]) ch4_ready <= 1;
 
 	SDRAM_DQ <= 16'bZ;
 
@@ -243,6 +256,16 @@ always @(posedge clk) begin
 				command    <= CMD_ACTIVE;
 				state      <= STATE_WAIT;
 			end
+			else if(ch4_rq) begin
+				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 1'b1, ch4_addr[25:1]};
+				chip       <= ch4_addr[26];
+				saved_data <= 16'b0;
+				saved_wr   <= 1'b0;
+				ch         <= 2'd3;
+				ch4_rq     <= 0;
+				command    <= CMD_ACTIVE;
+				state      <= STATE_WAIT;
+			end
 		end
 
 		STATE_WAIT: state <= STATE_RW1;
@@ -264,7 +287,8 @@ always @(posedge clk) begin
 				state   <= STATE_IDLE_5;
 				     if(ch == 0) data_ready_delay1[CAS_LATENCY+BURST_LENGTH] <= 1;
 				else if(ch == 1) data_ready_delay2[CAS_LATENCY+BURST_LENGTH] <= 1;
-				else             data_ready_delay3[CAS_LATENCY+BURST_LENGTH] <= 1;
+				else if(ch == 2) data_ready_delay3[CAS_LATENCY+BURST_LENGTH] <= 1;
+				else             data_ready_delay4[CAS_LATENCY+BURST_LENGTH] <= 1;
 			end
 		end
 

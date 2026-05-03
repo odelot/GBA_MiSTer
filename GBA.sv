@@ -470,7 +470,8 @@ savestate_ui savestate_ui
 	.joyUp          (joy_unmod[3]             ),
 	.joyStart       (joy_unmod[9]             ),
 	.joyRewind      (joy_unmod[11]            ),
-	.rewindEnable   (status[27]               ),
+	.rewindEnable   (status[27] & ~hardcore   ),
+
 	.status_slot    (status[38:37]            ),
 	.autoincslot    (status[43]               ),
 	.OSD_saveload   (status[18:17]            ),
@@ -514,9 +515,9 @@ always @(posedge clk_sys) begin : ffwd
 		end
 	end
 
-	fast_forward <= (joy[10] | ff_latch) & ~force_turbo;
+	fast_forward <= (joy[10] | ff_latch) & ~force_turbo & ~hardcore;
 	pause <= force_pause | (status[5] & OSD_STATUS & ~status[27]); // pause from "sync to core" or "pause in osd", but not if rewind capture is on
-	cpu_turbo <= ((status[16] & ~fast_forward) | force_turbo) & ~pause;
+	cpu_turbo <= (((status[16] & ~hardcore) & ~fast_forward) | force_turbo) & ~pause;
 end
 
 reg [79:0] time_dout = 41'd0;
@@ -574,8 +575,8 @@ gba
 	.specialmodule(gpio_quirk | status[40]),
 	.solar_in(status[31:29]),
 	.tilt(tilt_quirk),
-   .rewind_on(status[27]),
-   .rewind_active(status[27] & joy[11]),
+   .rewind_on(status[27] & ~hardcore),
+   .rewind_active(status[27] & joy[11] & ~hardcore),
    .savestate_number(ss_slot),
 
    .RTC_timestampNew(RTC_time[32]),
@@ -817,7 +818,12 @@ sdram sdram
 	.ch3_dout(sdr_bram_din),
 	.ch3_req(bram_req & sdram_en),
 	.ch3_rnw(~bk_loading || extra_data_addr),
-	.ch3_ready(sdr_bram_ack)
+	.ch3_ready(sdr_bram_ack),
+
+	.ch4_addr(ra_sdram_addr),
+	.ch4_dout(ra_sdram_dout),
+	.ch4_req(ra_sdram_req),
+	.ch4_ready(ra_sdram_ready)
 );
 
 always @(posedge clk_sys) begin
@@ -890,6 +896,12 @@ ra_ram_mirror_gba ra_mirror(
         .clk(clk_sys),
         .reset(reset),
         .vblank(vsync),
+        .sdram_en(sdram_en),
+
+        .sdram_addr(ra_sdram_addr),
+        .sdram_req(ra_sdram_req),
+        .sdram_dout(ra_sdram_dout),
+        .sdram_ready(ra_sdram_ready),
 
         .iwram_addr(ra_iwram_addr),
         .iwram_dout(ra_iwram_data),
@@ -1514,6 +1526,10 @@ end
 // RetroAchievements RAM mirror signals
 wire [14:0] ra_iwram_addr;
 wire  [7:0] ra_iwram_data;
+wire [26:1] ra_sdram_addr;
+wire        ra_sdram_req;
+wire [31:0] ra_sdram_dout;
+wire        ra_sdram_ready;
 wire [24:0] ra_ddram_addr;
 wire [63:0] ra_ddram_din;
 wire  [7:0] ra_ddram_be;

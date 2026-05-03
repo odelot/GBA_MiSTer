@@ -6,8 +6,8 @@
 //
 // GBA RA Memory Map (rcheevos virtual addresses):
 //   0x00000-0x07FFF (32KB)  → IWRAM — BRAM Port B
-//   0x08000-0x47FFF (256KB) → EWRAM — DDRAM
-//   0x48000-0x57FFF (64KB)  → Cart RAM — DDRAM
+//   0x08000-0x47FFF (256KB) → EWRAM — SDRAM ch4 (sdram_en=1) or DDRAM (sdram_en=0)
+//   0x48000-0x57FFF (64KB)  → Cart RAM — SDRAM ch4 (sdram_en=1) or DDRAM (sdram_en=0)
 
 module ra_ram_mirror_gba #(
 parameter [28:0] DDRAM_BASE       = 29'h07A00000,
@@ -17,6 +17,13 @@ parameter [24:0] FLASH_BASE_DWORD = 0
 input             clk,
 input             reset,
 input             vblank,
+input             sdram_en,     // 1=EWRAM/Cart in SDRAM ch4, 0=in DDRAM
+
+// SDRAM ch4 read (for EWRAM/Cart RAM when sdram_en=1)
+output reg [26:1] sdram_addr,
+output reg        sdram_req,
+input      [31:0] sdram_dout,
+input             sdram_ready,
 
 // IWRAM BRAM Port B read (byte-addressable, 32KB)
 output reg [14:0] iwram_addr,
@@ -76,15 +83,15 @@ localparam S_DISPATCH = 5'd7;
 localparam S_FETCH_IWRAM = 5'd8;
 localparam S_IWRAM_WAIT = 5'd9;
 localparam S_DDR_DATA_WAIT = 5'd10;
+localparam S_FETCH_SDR     = 5'd18;  // SDRAM read request
+localparam S_SDR_WAIT      = 5'd19;  // Wait for SDRAM ready
 localparam S_STORE_VAL = 5'd11;
 localparam S_FLUSH_BUF = 5'd12;
 localparam S_WRITE_RESP = 5'd13;
 localparam S_WR_HDR0 = 5'd14;
 localparam S_WR_HDR1 = 5'd15;
-localparam S_IWRAM_VERIFY = 5'd16;
-localparam S_IWRAM_CHECK  = 5'd17;
-localparam S_WR_DBG = 5'd18;
-localparam S_WR_DBG2 = 5'd19;
+localparam S_WR_DBG = 5'd16;
+localparam S_WR_DBG2 = 5'd17;
 
 reg [4:0]  state;
 reg [4:0]  return_state;
@@ -100,6 +107,7 @@ reg [63:0] collect_buf;
 reg  [3:0] collect_cnt;
 reg [12:0] val_word_idx;
 reg  [7:0] fetch_byte;
+reg [15:0] timeout;
 reg  [7:0] dbg_dispatch_cnt;
 reg [15:0] dbg_iwram_cnt;
 reg [15:0] dbg_ewram_cnt;
@@ -108,8 +116,6 @@ reg [15:0] dbg_ok_cnt;
 reg [15:0] dbg_timeout_cnt;
 reg [15:0] dbg_first_addr;
 reg  [2:0] byte_sel;      // byte position within 64-bit DDRAM qword
-reg  [7:0] iwram_first_val; // First BRAM read for collision detection
-reg  [2:0] iwram_retry;     // Retry counter for BRAM collision
 
 // ======================================================================
 // Address computation helpers
@@ -133,8 +139,10 @@ active            <= 1'b0;
 frame_counter     <= 32'd0;
 dbg_frame_counter <= 32'd0;
 ddram_req         <= dd_ack_s2;
+sdram_req         <= 1'b0;
 end
 else begin
+sdram_req <= 1'b0;  // default: deassert each cycle
 case (state)
 
 // =============================================================
@@ -229,26 +237,39 @@ dbg_first_addr <= cur_addr[15:0];
 if (cur_addr < IWRAM_END) begin
 dbg_iwram_cnt <= dbg_iwram_cnt + 16'd1;
 iwram_addr <= cur_addr[14:0];  // Set BRAM addr early (registered read needs 2 cycles)
-iwram_retry <= 3'd0;
 state <= S_FETCH_IWRAM;
 end
 else if (cur_addr < EWRAM_END) begin
 dbg_ewram_cnt <= dbg_ewram_cnt + 16'd1;
-byte_sel <= ewram_offset[2:0];
-ddram_addr <= {1'b0, ewram_dword[24:1]};
-ddram_we   <= 1'b0;
-ddram_req  <= ~ddram_req;
-return_state  <= S_DDR_DATA_WAIT;
-state         <= S_DD_RD_WAIT;
+if (sdram_en) begin
+    byte_sel  <= {1'b0, ewram_offset[1:0]};
+    sdram_addr <= {ewram_dword, 1'b0};
+    sdram_req  <= 1'b1;
+    state      <= S_FETCH_SDR;
+end else begin
+    byte_sel <= ewram_offset[2:0];
+    ddram_addr <= {1'b0, ewram_dword[24:1]};
+    ddram_we   <= 1'b0;
+    ddram_req  <= ~ddram_req;
+    return_state  <= S_DDR_DATA_WAIT;
+    state         <= S_DD_RD_WAIT;
+end
 end
 else if (cur_addr < CART_END) begin
 dbg_cart_cnt <= dbg_cart_cnt + 16'd1;
-byte_sel <= cart_offset[2:0];
-ddram_addr <= {1'b0, cart_dword[24:1]};
-ddram_we   <= 1'b0;
-ddram_req  <= ~ddram_req;
-return_state  <= S_DDR_DATA_WAIT;
-state         <= S_DD_RD_WAIT;
+if (sdram_en) begin
+    byte_sel  <= {1'b0, cart_offset[1:0]};
+    sdram_addr <= {cart_dword, 1'b0};
+    sdram_req  <= 1'b1;
+    state      <= S_FETCH_SDR;
+end else begin
+    byte_sel <= cart_offset[2:0];
+    ddram_addr <= {1'b0, cart_dword[24:1]};
+    ddram_we   <= 1'b0;
+    ddram_req  <= ~ddram_req;
+    return_state  <= S_DDR_DATA_WAIT;
+    state         <= S_DD_RD_WAIT;
+end
 end
 else begin
 fetch_byte <= 8'd0;
@@ -258,36 +279,39 @@ end
 
 // =============================================================
 S_FETCH_IWRAM: begin
-// Wait cycle 1: BRAM latches address set in S_DISPATCH
+// Wait cycle: BRAM latches address set in S_DISPATCH
 state <= S_IWRAM_WAIT;
 end
 
 S_IWRAM_WAIT: begin
-// First BRAM read complete. Save value, re-drive address for verification read.
-iwram_first_val <= iwram_dout;
-iwram_addr <= cur_addr[14:0];  // re-assert for 2nd read
-state <= S_IWRAM_VERIFY;
-end
-
-S_IWRAM_VERIFY: begin
-// Wait cycle 2: BRAM latches address for verification read
-state <= S_IWRAM_CHECK;
-end
-
-S_IWRAM_CHECK: begin
-// Compare 1st and 2nd reads to detect BRAM port B collision
-if (iwram_dout == iwram_first_val || iwram_retry >= 3'd4) begin
-// Match (or max retries exhausted) — value is reliable
+// BRAM registered output now valid (2 cycles after address set)
 fetch_byte <= iwram_dout;
 dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
 state <= S_STORE_VAL;
-end else begin
-// Mismatch — BRAM port B was hijacked by CPU write. Retry.
-iwram_first_val <= iwram_dout;
-iwram_addr <= cur_addr[14:0];  // re-drive address
-iwram_retry <= iwram_retry + 3'd1;
-dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;  // track retries
-state <= S_IWRAM_VERIFY;  // back to wait for next BRAM latch
+end
+
+// =============================================================
+// SDRAM ch4 read (sdram_en=1 path for EWRAM/Cart)
+S_FETCH_SDR: begin
+timeout <= 16'd0;
+state   <= S_SDR_WAIT;
+end
+
+S_SDR_WAIT: begin
+timeout <= timeout + 16'd1;
+if (sdram_ready) begin
+    case (byte_sel[1:0])
+        2'd0: fetch_byte <= sdram_dout[ 7: 0];
+        2'd1: fetch_byte <= sdram_dout[15: 8];
+        2'd2: fetch_byte <= sdram_dout[23:16];
+        2'd3: fetch_byte <= sdram_dout[31:24];
+    endcase
+    dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+    state <= S_STORE_VAL;
+end else if (timeout >= 16'hFFFF) begin
+    fetch_byte <= 8'd0;
+    dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;
+    state <= S_STORE_VAL;
 end
 end
 
