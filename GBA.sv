@@ -654,7 +654,8 @@ gba
 	.sound_out_right(GBA_AUDIO_R),
 
 	.ra_iwram_addr(ra_iwram_addr),
-	.ra_iwram_data(ra_iwram_data)
+	.ra_iwram_data(ra_iwram_data),
+	.ra_iwram_we(ra_iwram_we)
 );
 
 assign AUDIO_L = (fast_forward && status[19]) ? 16'd0 : GBA_AUDIO_L;
@@ -905,6 +906,7 @@ ra_ram_mirror_gba ra_mirror(
 
         .iwram_addr(ra_iwram_addr),
         .iwram_dout(ra_iwram_data),
+        .iwram_we(ra_iwram_we),
 
         .ddram_addr(ra_ddram_addr),
         .ddram_din(ra_ddram_din),
@@ -1526,6 +1528,7 @@ end
 // RetroAchievements RAM mirror signals
 wire [14:0] ra_iwram_addr;
 wire  [7:0] ra_iwram_data;
+wire  [3:0] ra_iwram_we;
 wire [26:1] ra_sdram_addr;
 wire        ra_sdram_req;
 wire [31:0] ra_sdram_dout;

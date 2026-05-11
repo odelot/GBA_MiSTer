@@ -119,6 +119,7 @@ entity gba_memorymux is
       -- RetroAchievements IWRAM read port (via BRAM port B)
       ra_iwram_addr        : in     std_logic_vector(14 downto 0) := (others => '0');
       ra_iwram_data        : out    std_logic_vector(7 downto 0);
+      ra_iwram_we          : out    std_logic_vector(0 to 3);
       
       debug_mem            : out    std_logic_vector(31 downto 0)  
    );
@@ -323,6 +324,8 @@ begin
    -- RetroAchievements: convert byte address to word address for BRAM port B
    ra_iwram_addr_int <= to_integer(unsigned(ra_iwram_addr(14 downto 2)));
    
+   ra_iwram_we <= smallram_we;
+
    -- Byte select from 32-bit BRAM output
    with ra_iwram_addr(1 downto 0) select
       ra_iwram_data <= ra_iwram_dout( 7 downto  0) when "00",

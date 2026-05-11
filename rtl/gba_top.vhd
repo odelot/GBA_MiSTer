@@ -140,7 +140,8 @@ entity gba_top is
       debug_mem             : out    std_logic_vector(31 downto 0);
       -- RetroAchievements IWRAM read port
       ra_iwram_addr         : in     std_logic_vector(14 downto 0) := (others => '0');
-      ra_iwram_data         : out    std_logic_vector(7 downto 0)  
+      ra_iwram_data         : out    std_logic_vector(7 downto 0);
+      ra_iwram_we           : out    std_logic_vector(0 to 3)
    );
 end entity;
 
@@ -742,7 +743,8 @@ begin
 
       debug_mem            => debug_mem,
       ra_iwram_addr        => ra_iwram_addr,
-      ra_iwram_data        => ra_iwram_data
+      ra_iwram_data        => ra_iwram_data,
+      ra_iwram_we          => ra_iwram_we
    );
    
    igba_dma : entity work.gba_dma

@@ -28,6 +28,7 @@ input             sdram_ready,
 // IWRAM BRAM Port B read (byte-addressable, 32KB)
 output reg [14:0] iwram_addr,
 input       [7:0] iwram_dout,
+input       [3:0] iwram_we,   // 1 = IWRAM write in progress (Port B busy)
 
 // DDRAM combined interface (toggle req/ack, lowest priority)
 output reg [24:0] ddram_addr,
@@ -237,6 +238,7 @@ dbg_first_addr <= cur_addr[15:0];
 if (cur_addr < IWRAM_END) begin
 dbg_iwram_cnt <= dbg_iwram_cnt + 16'd1;
 iwram_addr <= cur_addr[14:0];  // Set BRAM addr early (registered read needs 2 cycles)
+timeout   <= 16'd0;            // Reset write-collision watchdog
 state <= S_FETCH_IWRAM;
 end
 else if (cur_addr < EWRAM_END) begin
@@ -279,8 +281,11 @@ end
 
 // =============================================================
 S_FETCH_IWRAM: begin
-// Wait cycle: BRAM latches address set in S_DISPATCH
-state <= S_IWRAM_WAIT;
+// Wait until Port B is free (no CPU IWRAM write), then data is valid next cycle.
+// If timeout (>255 cycles), proceed anyway (rare stale read is better than hang).
+timeout <= timeout + 16'd1;
+if (iwram_we == 4'b0000 || timeout >= 16'd255)
+    state <= S_IWRAM_WAIT;
 end
 
 S_IWRAM_WAIT: begin
