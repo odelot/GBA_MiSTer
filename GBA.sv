@@ -219,6 +219,8 @@ pll pll
 );
 
 wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading | hold_reset;
+// GBA_on held low during IWRAM/EWRAM clear (ra_clear_busy) to prevent stale-RAM false positives
+wire gba_clear_reset = reset | ra_clear_busy;
 
 ////////////////////////////  HPS I/O  //////////////////////////////////
 
@@ -553,7 +555,7 @@ gba_top
 gba
 (
 	.clk100(clk_sys),
-	.GBA_on(~reset && ~romcopy_active),  // switching from off to on = reset
+	.GBA_on(~gba_clear_reset && ~romcopy_active),  // held low during RA clear
 	.GBA_lockspeed(~fast_forward),       // 1 = 100% speed, 0 = max speed
 	.GBA_cputurbo(cpu_turbo),
 	.GBA_flash_1m(flash_1m),          // 1 when string "FLASH1M_V" is anywhere in gamepak
@@ -655,7 +657,9 @@ gba
 
 	.ra_iwram_addr(ra_iwram_addr),
 	.ra_iwram_data(ra_iwram_data),
-	.ra_iwram_we(ra_iwram_we)
+	.ra_iwram_we(ra_iwram_we),
+	.ra_clear_addr(ra_iwram_clear_addr),
+	.ra_clear_we_in(ra_iwram_clear_we)
 );
 
 assign AUDIO_L = (fast_forward && status[19]) ? 16'd0 : GBA_AUDIO_L;
@@ -907,6 +911,10 @@ ra_ram_mirror_gba ra_mirror(
         .iwram_addr(ra_iwram_addr),
         .iwram_dout(ra_iwram_data),
         .iwram_we(ra_iwram_we),
+        .cart_download(cart_download),
+        .ra_clear_busy(ra_clear_busy),
+        .iwram_clear_addr(ra_iwram_clear_addr),
+        .iwram_clear_we(ra_iwram_clear_we),
 
         .ddram_addr(ra_ddram_addr),
         .ddram_din(ra_ddram_din),
@@ -1529,6 +1537,9 @@ end
 wire [14:0] ra_iwram_addr;
 wire  [7:0] ra_iwram_data;
 wire  [3:0] ra_iwram_we;
+wire [12:0] ra_iwram_clear_addr;
+wire  [3:0] ra_iwram_clear_we;
+wire        ra_clear_busy;
 wire [26:1] ra_sdram_addr;
 wire        ra_sdram_req;
 wire [31:0] ra_sdram_dout;

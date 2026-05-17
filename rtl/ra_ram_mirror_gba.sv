@@ -30,6 +30,12 @@ output reg [14:0] iwram_addr,
 input       [7:0] iwram_dout,
 input       [3:0] iwram_we,   // 1 = IWRAM write in progress (Port B busy)
 
+// IWRAM clear on game load (cart_download-triggered)
+input             cart_download,    // ROM loading active; falling edge triggers clear
+output reg        ra_clear_busy,    // holds reset=1 while clearing IWRAM
+output reg [12:0] iwram_clear_addr, // BRAM word address to clear (0..8191)
+output reg  [3:0] iwram_clear_we,
+
 // DDRAM combined interface (toggle req/ack, lowest priority)
 output reg [24:0] ddram_addr,
 output reg [63:0] ddram_din,
@@ -85,6 +91,11 @@ localparam S_FETCH_IWRAM = 5'd8;
 localparam S_IWRAM_WAIT = 5'd9;
 localparam S_DDR_DATA_WAIT = 5'd10;
 localparam S_FETCH_SDR     = 5'd18;  // SDRAM read request
+localparam S_READ_CFG      = 5'd20;  // Read ARM config byte from DDRAM
+localparam S_CLEAR_IWRAM   = 5'd22;  // BRAM clear loop (8192 word addresses)
+localparam S_CLEAR_EWRAM   = 5'd23;  // DDRAM EWRAM clear loop (32768 words)
+localparam S_CLEAR_DONE    = 5'd24;  // Deassert ra_clear_busy, return to IDLE
+localparam S_PARSE_CFG     = 5'd21;  // Extract clear_en_r from config word
 localparam S_SDR_WAIT      = 5'd19;  // Wait for SDRAM ready
 localparam S_STORE_VAL = 5'd11;
 localparam S_FLUSH_BUF = 5'd12;
@@ -118,6 +129,12 @@ reg [15:0] dbg_timeout_cnt;
 reg [15:0] dbg_first_addr;
 reg  [2:0] byte_sel;      // byte position within 64-bit DDRAM qword
 
+// IWRAM/EWRAM clear control
+reg        clear_en_r;         // latched from DDRAM ARM config bit 1
+reg        cart_dl_prev;       // previous cart_download for edge detection
+reg        clear_trigger;      // one-cycle pulse triggering the clear sequence
+reg [14:0] ewram_clear_cnt;    // EWRAM DDRAM word counter (0..32767 = 256KB)
+
 // ======================================================================
 // Address computation helpers
 // ======================================================================
@@ -141,6 +158,11 @@ frame_counter     <= 32'd0;
 dbg_frame_counter <= 32'd0;
 ddram_req         <= dd_ack_s2;
 sdram_req         <= 1'b0;
+clear_en_r        <= 1'b0;
+ra_clear_busy     <= 1'b0;
+iwram_clear_addr  <= 13'd0;
+iwram_clear_we    <= 4'b0000;
+ewram_clear_cnt   <= 15'd0;
 end
 else begin
 sdram_req <= 1'b0;  // default: deassert each cycle
@@ -149,7 +171,13 @@ case (state)
 // =============================================================
 S_IDLE: begin
 active <= 1'b0;
-if (vblank_rising) begin
+if (clear_trigger) begin
+    // ROM load complete: clear IWRAM then EWRAM before releasing GBA
+    ra_clear_busy    <= 1'b1;
+    iwram_clear_addr <= 13'd0;
+    iwram_clear_we   <= 4'b1111;
+    state            <= S_CLEAR_IWRAM;
+end else if (vblank_rising) begin
 active <= 1'b1;
 // Reset debug counters
 dbg_ok_cnt <= 16'd0;
@@ -165,7 +193,7 @@ ddram_din  <= {16'h0100, 8'h01, 8'd0, 32'h52414348};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
-return_state  <= S_READ_HDR;
+return_state  <= S_READ_CFG;
 state         <= S_DD_WR_WAIT;
 end
 end
@@ -182,6 +210,64 @@ if (ddram_req == dd_ack_s2) begin
 rd_data <= ddram_dout;
 state   <= return_state;
 end
+end
+
+// =============================================================
+// CLEAR: Step 1 — iterate IWRAM BRAM (8192 words = 32KB)
+S_CLEAR_IWRAM: begin
+    if (iwram_clear_addr == 13'd8191) begin
+        iwram_clear_we  <= 4'b0000;  // done: disable BRAM writes
+        ewram_clear_cnt <= 15'd0;
+        state           <= S_CLEAR_EWRAM;
+    end else begin
+        iwram_clear_addr <= iwram_clear_addr + 13'd1;
+    end
+end
+
+// =============================================================
+// CLEAR: Step 2 — iterate EWRAM in DDRAM (32768 words = 256KB)
+// Skipped when sdram_en=1 (EWRAM in SDRAM; BIOS clears on boot)
+S_CLEAR_EWRAM: begin
+    if (sdram_en) begin
+        state <= S_CLEAR_DONE;  // EWRAM in SDRAM: rely on BIOS clear
+    end else begin
+        ddram_addr <= EWRAM_BASE_DWORD[24:0] + {10'd0, ewram_clear_cnt};
+        ddram_din  <= 64'd0;
+        ddram_be   <= 8'hFF;
+        ddram_we   <= 1'b1;
+        ddram_req  <= ~ddram_req;
+        if (ewram_clear_cnt == 15'd32767) begin
+            return_state <= S_CLEAR_DONE;
+        end else begin
+            ewram_clear_cnt <= ewram_clear_cnt + 15'd1;
+            return_state    <= S_CLEAR_EWRAM;
+        end
+        state <= S_DD_WR_WAIT;
+    end
+end
+
+// =============================================================
+// CLEAR: Step 3 — release GBA from extended reset
+S_CLEAR_DONE: begin
+    ra_clear_busy <= 1'b0;
+    state         <= S_IDLE;
+end
+
+// =============================================================
+S_READ_CFG: begin
+    // Read ARM config word: RA_ARM_CONFIG_OFFSET=0x40 = DDRAM word 8
+    ddram_addr <= DDRAM_BASE[24:0] + 25'd8;
+    ddram_we   <= 1'b0;
+    ddram_req  <= ~ddram_req;
+    return_state  <= S_PARSE_CFG;
+    state         <= S_DD_RD_WAIT;
+end
+
+// =============================================================
+S_PARSE_CFG: begin
+    // rd_data[1] = RA_ARM_CFG_CLEAR_EN (byte 0, bit 1 of config word)
+    clear_en_r <= rd_data[1];
+    state      <= S_READ_HDR;
 end
 
 // =============================================================
@@ -447,6 +533,24 @@ end
 default: state <= S_IDLE;
 endcase
 end
+end
+
+// ======================================================================
+// Edge detection: triggers IWRAM+EWRAM clear sequence on cart_download fall
+// cart_dl_prev always tracks cart_download (not gated by reset) so the
+// falling edge is detected even after reset deasserts.
+// clear_trigger is a 1-cycle pulse consumed by the main state machine.
+// NOTE: ra_mirror reset does NOT include ra_clear_busy (see GBA.sv).
+//       GBA_on uses gba_clear_reset = reset | ra_clear_busy instead.
+// ======================================================================
+always @(posedge clk) begin
+    cart_dl_prev <= cart_download;  // Track regardless of reset
+    if (reset) begin
+        clear_trigger <= 1'b0;
+    end else begin
+        // One-cycle pulse: cart_download 1→0 AND clear enabled
+        clear_trigger <= cart_dl_prev && !cart_download && clear_en_r;
+    end
 end
 
 endmodule
