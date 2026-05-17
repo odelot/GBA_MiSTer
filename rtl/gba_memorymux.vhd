@@ -120,6 +120,8 @@ entity gba_memorymux is
       ra_iwram_addr        : in     std_logic_vector(14 downto 0) := (others => '0');
       ra_iwram_data        : out    std_logic_vector(7 downto 0);
       ra_iwram_we          : out    std_logic_vector(0 to 3);
+      ra_clear_addr        : in     std_logic_vector(12 downto 0) := (others => '0');
+      ra_clear_we_in       : in     std_logic_vector(0 to 3)       := (others => '0');
       
       debug_mem            : out    std_logic_vector(31 downto 0)  
    );
@@ -188,6 +190,7 @@ architecture arch of gba_memorymux is
    signal smallram_DataOut   : std_logic_vector(31 downto 0) := (others => '0');
    signal smallram_we        : std_logic_vector(0 to 3) := (others => '0');
    signal ra_iwram_addr_int  : integer range 0 to 8191 := 0;
+   signal ra_clear_addr_int  : integer range 0 to 8191 := 0;
    signal ra_iwram_dout      : std_logic_vector(31 downto 0);
                              
    signal read_operation     : std_logic := '0';
@@ -288,8 +291,16 @@ begin
       signal smallram_din_single  : std_logic_vector(7 downto 0);
       signal smallram_dout_b      : std_logic_vector(7 downto 0);
       signal smallram_addr_b_mux  : integer;
+      signal smallram_we_b_final  : std_logic;
+      signal smallram_din_b_final : std_logic_vector(7 downto 0);
    begin
-      smallram_addr_b_mux <= ra_iwram_addr_int when (smallram_we = "0000") else smallram_addr_w;
+      -- Priority: CPU write > RA clear > RA read
+      smallram_addr_b_mux <= smallram_addr_w   when (smallram_we /= "0000") else
+                             ra_clear_addr_int when (ra_clear_we_in /= "0000") else
+                             ra_iwram_addr_int;
+      smallram_we_b_final  <= smallram_we(i) or ra_clear_we_in(i);
+      smallram_din_b_final <= (others => '0') when ra_clear_we_in(i) = '1'
+                             else smallram_din_single;
 
       ismallram: entity MEM.SyncRamDual
       generic map
@@ -308,9 +319,9 @@ begin
          re_a       => '1',
                   
          addr_b     => smallram_addr_b_mux,
-         datain_b   => smallram_din_single,
+         datain_b   => smallram_din_b_final,
          dataout_b  => smallram_dout_b,
-         we_b       => smallram_we(i),
+         we_b       => smallram_we_b_final,
          re_b       => '1' 
       );
       
@@ -323,6 +334,7 @@ begin
    
    -- RetroAchievements: convert byte address to word address for BRAM port B
    ra_iwram_addr_int <= to_integer(unsigned(ra_iwram_addr(14 downto 2)));
+   ra_clear_addr_int <= to_integer(unsigned(ra_clear_addr));
    
    ra_iwram_we <= smallram_we;
 
