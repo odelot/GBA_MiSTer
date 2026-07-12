@@ -56,10 +56,13 @@ module sdram
 	input             ch3_rnw,
 	output reg        ch3_ready,
 
-	// ch4: RetroAchievements SDRAM read (32-bit, lowest priority, read-only)
+	// ch4: RetroAchievements SDRAM channel (lowest priority).
+	// Reads: 32-bit (RAM mirror scan). Writes: single 16-bit (game-load clear).
 	input      [26:1] ch4_addr,
 	output reg [31:0] ch4_dout,
+	input      [15:0] ch4_din,
 	input             ch4_req,
+	input             ch4_rnw,     // 1 - read, 0 - write
 	output reg        ch4_ready
 );
 
@@ -257,10 +260,11 @@ always @(posedge clk) begin
 				state      <= STATE_WAIT;
 			end
 			else if(ch4_rq) begin
+				// A10=1 (auto-precharge) like ch1: single write or full-burst read
 				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 1'b1, ch4_addr[25:1]};
 				chip       <= ch4_addr[26];
-				saved_data <= 16'b0;
-				saved_wr   <= 1'b0;
+				saved_data <= {16'b0, ch4_din};
+				saved_wr   <= ~ch4_rnw;
 				ch         <= 2'd3;
 				ch4_rq     <= 0;
 				command    <= CMD_ACTIVE;
@@ -276,6 +280,10 @@ always @(posedge clk) begin
 				SDRAM_DQ <= saved_data[15:0];
 				if(!ch) begin
 					ch1_ready  <= 1;
+					state <= STATE_IDLE_2;
+				end
+				else if(ch == 3) begin
+					ch4_ready  <= 1;
 					state <= STATE_IDLE_2;
 				end
 				else begin

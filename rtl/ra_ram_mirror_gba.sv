@@ -1,8 +1,22 @@
-// RetroAchievements RAM Mirror for GBA — Option C (Optimized for routing)
+// RetroAchievements RAM Mirror for GBA — Option C v2 (rtquery mailbox)
 //
 // Each VBlank, reads address list from DDRAM (written by ARM),
-// fetches byte values from IWRAM (BRAM) or EWRAM/Cart RAM (DDRAM),
+// fetches byte values from IWRAM (BRAM) or EWRAM/Cart RAM (SDRAM/DDRAM),
 // writes results back to DDRAM for the ARM.
+//
+// v2 additions:
+//  - Realtime query mailbox (RA_QUERY_* protocol, same as SNES v2+):
+//    ARM writes query addresses, FPGA answers within ~µs. Used by the
+//    smart cache to resolve AddAddress pointer targets on cache miss.
+//  - Game-load clear covers both storage modes:
+//      DDR3 mode  : flash region filled with 0xFF, EWRAM zeroed (qword writes)
+//      SDRAM mode : flash region filled with 0xFF, EWRAM zeroed (ch4 writes)
+//    (v1 cleared the wrong DDR3 region — dword base used as qword address —
+//     which corrupted 256KB of ROM instead of clearing EWRAM.)
+//  - VBlank and clear triggers are latched (no lost pulses while the FSM
+//    is busy polling the query mailbox or clearing).
+//  - DDRAM handshake watchdog: a stuck ack can no longer hold the GBA in
+//    reset forever via ra_clear_busy.
 //
 // GBA RA Memory Map (rcheevos virtual addresses):
 //   0x00000-0x07FFF (32KB)  → IWRAM — BRAM Port B
@@ -19,8 +33,10 @@ input             reset,
 input             vblank,
 input             sdram_en,     // 1=EWRAM/Cart in SDRAM ch4, 0=in DDRAM
 
-// SDRAM ch4 read (for EWRAM/Cart RAM when sdram_en=1)
+// SDRAM ch4 (EWRAM/Cart when sdram_en=1; reads for scan, writes for clear)
 output reg [26:1] sdram_addr,
+output reg [15:0] sdram_din,
+output reg        sdram_rnw,    // 1=read, 0=write (clear path)
 output reg        sdram_req,
 input      [31:0] sdram_dout,
 input             sdram_ready,
@@ -32,6 +48,7 @@ input       [3:0] iwram_we,   // 1 = IWRAM write in progress (Port B busy)
 
 // IWRAM clear on game load (cart_download-triggered)
 input             cart_download,    // ROM loading active; falling edge triggers clear
+input             save_loading,     // bk_loading: save file being written to the flash region
 output reg        ra_clear_busy,    // holds reset=1 while clearing IWRAM
 output reg [12:0] iwram_clear_addr, // BRAM word address to clear (0..8191)
 output reg  [3:0] iwram_clear_we,
@@ -57,9 +74,27 @@ localparam [28:0] ADDRLIST_BASE = DDRAM_BASE + 29'h8000;  // byte offset 0x40000
 localparam [28:0] VALCACHE_BASE = DDRAM_BASE + 29'h9000;  // byte offset 0x48000 / 8
 localparam [12:0] MAX_ADDRS     = 13'd4096;
 
+// Realtime query mailbox (byte offsets 0x50000/0x50008/0x50088, in qwords)
+localparam [28:0] QUERY_CTRL_ADDR = DDRAM_BASE + 29'hA000;
+localparam [28:0] QUERY_REQ_BASE  = DDRAM_BASE + 29'hA001;
+localparam [28:0] QUERY_RESP_BASE = DDRAM_BASE + 29'hA011;
+localparam [7:0]  MAX_RT_QUERIES  = 8'd16;
+
 localparam [31:0] IWRAM_END = 32'h08000;
 localparam [31:0] EWRAM_END = 32'h48000;
 localparam [31:0] CART_END  = 32'h58000;
+
+// Clear geometry.
+// DDR3 (qword writes):  flash 128KB = 16384 qwords @ qword(FLASH_BASE_DWORD/2)
+//                       EWRAM 256KB = 32768 qwords @ qword(EWRAM_BASE_DWORD/2)
+// SDRAM (16-bit writes): flash 128KB = 65536 halfwords @ hw 0
+//                        EWRAM 256KB = 131072 halfwords @ hw 0x40000
+localparam [17:0] CLR_DDR_FLASH_LAST  = 18'd16383;
+localparam [17:0] CLR_DDR_EWRAM_LAST  = 18'd32767;
+localparam [17:0] CLR_SDR_FLASH_LAST  = 18'd65535;
+localparam [17:0] CLR_SDR_EWRAM_LAST  = 18'd131071;
+localparam [25:0] EWRAM_HW_BASE       = {EWRAM_BASE_DWORD, 1'b0};
+localparam [25:0] FLASH_HW_BASE       = {FLASH_BASE_DWORD, 1'b0};
 
 // ======================================================================
 // CDC synchronizers for DDRAM toggle ack signals
@@ -77,36 +112,45 @@ wire vblank_rising = vblank & ~vblank_prev;
 always @(posedge clk) vblank_prev <= vblank;
 
 // ======================================================================
-// State machine (5-bit, 18 states)
+// State machine (6-bit)
 // ======================================================================
-localparam S_IDLE = 5'd0;
-localparam S_DD_WR_WAIT = 5'd1;
-localparam S_DD_RD_WAIT = 5'd2;
-localparam S_READ_HDR = 5'd3;
-localparam S_PARSE_HDR = 5'd4;
-localparam S_READ_PAIR = 5'd5;
-localparam S_PARSE_ADDR = 5'd6;
-localparam S_DISPATCH = 5'd7;
-localparam S_FETCH_IWRAM = 5'd8;
-localparam S_IWRAM_WAIT = 5'd9;
-localparam S_DDR_DATA_WAIT = 5'd10;
-localparam S_FETCH_SDR     = 5'd18;  // SDRAM read request
-localparam S_READ_CFG      = 5'd20;  // Read ARM config byte from DDRAM
-localparam S_CLEAR_IWRAM   = 5'd22;  // BRAM clear loop (8192 word addresses)
-localparam S_CLEAR_EWRAM   = 5'd23;  // DDRAM EWRAM clear loop (32768 words)
-localparam S_CLEAR_DONE    = 5'd24;  // Deassert ra_clear_busy, return to IDLE
-localparam S_PARSE_CFG     = 5'd21;  // Extract clear_en_r from config word
-localparam S_SDR_WAIT      = 5'd19;  // Wait for SDRAM ready
-localparam S_STORE_VAL = 5'd11;
-localparam S_FLUSH_BUF = 5'd12;
-localparam S_WRITE_RESP = 5'd13;
-localparam S_WR_HDR0 = 5'd14;
-localparam S_WR_HDR1 = 5'd15;
-localparam S_WR_DBG = 5'd16;
-localparam S_WR_DBG2 = 5'd17;
+localparam S_IDLE          = 6'd0;
+localparam S_DD_WR_WAIT    = 6'd1;
+localparam S_DD_RD_WAIT    = 6'd2;
+localparam S_READ_HDR      = 6'd3;
+localparam S_PARSE_HDR     = 6'd4;
+localparam S_READ_PAIR     = 6'd5;
+localparam S_PARSE_ADDR    = 6'd6;
+localparam S_DISPATCH      = 6'd7;
+localparam S_FETCH_IWRAM   = 6'd8;
+localparam S_IWRAM_WAIT    = 6'd9;
+localparam S_DDR_DATA_WAIT = 6'd10;
+localparam S_STORE_VAL     = 6'd11;
+localparam S_FLUSH_BUF     = 6'd12;
+localparam S_WRITE_RESP    = 6'd13;
+localparam S_WR_HDR0       = 6'd14;
+localparam S_WR_HDR1       = 6'd15;
+localparam S_WR_DBG        = 6'd16;
+localparam S_WR_DBG2       = 6'd17;
+localparam S_FETCH_SDR     = 6'd18;  // SDRAM read request
+localparam S_SDR_WAIT      = 6'd19;  // Wait for SDRAM ready
+localparam S_READ_CFG      = 6'd20;  // Read ARM config byte from DDRAM
+localparam S_PARSE_CFG     = 6'd21;  // Extract clear_en_r/rtq_en_r from config word
+localparam S_CLEAR_IWRAM   = 6'd22;  // BRAM clear loop (8192 word addresses)
+localparam S_CLEAR_DDR     = 6'd23;  // DDRAM clear loop (flash 0xFF, then EWRAM 0x00)
+localparam S_CLEAR_DONE    = 6'd24;  // Deassert ra_clear_busy, return to IDLE
+localparam S_CLEAR_SDR     = 6'd25;  // SDRAM clear write request
+localparam S_CLEAR_SDR_WAIT= 6'd26;  // Wait for SDRAM write done
+localparam S_RTQ_PARSE     = 6'd27;  // Parse query control word
+localparam S_RTQ_RD_REQ    = 6'd28;  // Read request slot
+localparam S_RTQ_REQ_PARSE = 6'd29;  // Latch address/num_bytes, start fetch
+localparam S_RTQ_STORE     = 6'd30;  // Accumulate fetched byte into value
+localparam S_RTQ_WR_RESP   = 6'd31;  // Write response slot
+localparam S_RTQ_WR_CTRL   = 6'd32;  // Write response_seq (commit)
 
-reg [4:0]  state;
-reg [4:0]  return_state;
+reg [5:0]  state;
+reg [5:0]  return_state;
+reg [5:0]  fetch_ret;     // state to enter once fetch_byte is valid
 
 reg [31:0] frame_counter;
 reg [63:0] rd_data;
@@ -120,6 +164,7 @@ reg  [3:0] collect_cnt;
 reg [12:0] val_word_idx;
 reg  [7:0] fetch_byte;
 reg [15:0] timeout;
+reg [19:0] dd_wait_cnt;   // watchdog for DDRAM handshake waits
 reg  [7:0] dbg_dispatch_cnt;
 reg [15:0] dbg_iwram_cnt;
 reg [15:0] dbg_ewram_cnt;
@@ -129,11 +174,27 @@ reg [15:0] dbg_timeout_cnt;
 reg [15:0] dbg_first_addr;
 reg  [2:0] byte_sel;      // byte position within 64-bit DDRAM qword
 
+// Latched event flags (pulses survive a busy FSM)
+reg        vbl_pending;
+reg        clear_pending;
+
 // IWRAM/EWRAM clear control
 reg        clear_en_r;         // latched from DDRAM ARM config bit 1
 reg        cart_dl_prev;       // previous cart_download for edge detection
 reg        clear_trigger;      // one-cycle pulse triggering the clear sequence
-reg [14:0] ewram_clear_cnt;    // EWRAM DDRAM word counter (0..32767 = 256KB)
+reg        clear_phase;        // 0 = flash fill (0xFF), 1 = EWRAM zero
+reg [17:0] clear_cnt;          // qword (DDR3) or halfword (SDRAM) counter
+
+// Realtime query mailbox
+reg        rtq_en_r;           // latched from DDRAM ARM config bit 0
+reg  [7:0] qry_request_seq;
+reg  [7:0] qry_last_seen_seq;
+reg  [7:0] qry_num;
+reg  [3:0] qry_idx;
+reg  [2:0] qry_num_bytes;
+reg [31:0] qry_value;
+reg  [2:0] qry_byte_idx;
+reg [10:0] qry_poll_timer;
 
 // ======================================================================
 // Address computation helpers
@@ -149,36 +210,57 @@ wire [24:0] cart_dword  = FLASH_BASE_DWORD  + {9'd0, cart_offset[15:2]};
 
 // ======================================================================
 // Main state machine
+// NOTE: reset is ignored while ra_clear_busy=1 so a reset pulse (e.g.
+// bk_loading rising right after the ROM download) cannot abort the clear
+// half-way and leave stale bytes behind. The watchdog on the DDRAM waits
+// guarantees ra_clear_busy is always eventually released.
 // ======================================================================
 always @(posedge clk) begin
-if (reset) begin
+if (reset && !ra_clear_busy) begin
 state             <= S_IDLE;
 active            <= 1'b0;
 frame_counter     <= 32'd0;
 dbg_frame_counter <= 32'd0;
 ddram_req         <= dd_ack_s2;
 sdram_req         <= 1'b0;
+sdram_rnw         <= 1'b1;
 clear_en_r        <= 1'b0;
+rtq_en_r          <= 1'b0;
 ra_clear_busy     <= 1'b0;
 iwram_clear_addr  <= 13'd0;
 iwram_clear_we    <= 4'b0000;
-ewram_clear_cnt   <= 15'd0;
+clear_phase       <= 1'b0;
+clear_cnt         <= 18'd0;
+vbl_pending       <= 1'b0;
+clear_pending     <= 1'b0;
+qry_last_seen_seq <= 8'd0;
+qry_poll_timer    <= 11'd0;
+dd_wait_cnt       <= 20'd0;
+fetch_ret         <= S_STORE_VAL;
 end
 else begin
 sdram_req <= 1'b0;  // default: deassert each cycle
+
+// Latch trigger pulses; consumed in S_IDLE (consume wins on same-cycle set)
+if (vblank_rising)  vbl_pending   <= 1'b1;
+if (clear_trigger)  clear_pending <= 1'b1;
+
 case (state)
 
 // =============================================================
 S_IDLE: begin
 active <= 1'b0;
-if (clear_trigger) begin
-    // ROM load complete: clear IWRAM then EWRAM before releasing GBA
+if (clear_pending) begin
+    // ROM load complete: clear IWRAM, fill flash 0xFF, zero EWRAM
+    clear_pending    <= 1'b0;
     ra_clear_busy    <= 1'b1;
     iwram_clear_addr <= 13'd0;
     iwram_clear_we   <= 4'b1111;
     state            <= S_CLEAR_IWRAM;
-end else if (vblank_rising) begin
+end else if (vbl_pending) begin
+vbl_pending <= 1'b0;
 active <= 1'b1;
+qry_poll_timer <= 11'd0;
 // Reset debug counters
 dbg_ok_cnt <= 16'd0;
 dbg_timeout_cnt <= 16'd0;
@@ -187,28 +269,57 @@ dbg_iwram_cnt <= 16'd0;
 dbg_ewram_cnt <= 16'd0;
 dbg_cart_cnt <= 16'd0;
 dbg_first_addr <= 16'd0;
-// Write header with busy=1
+// Write header with busy=1 (core_version 2.0)
 ddram_addr <= DDRAM_BASE[24:0];
-ddram_din  <= {16'h0100, 8'h01, 8'd0, 32'h52414348};
+ddram_din  <= {16'h0200, 8'h01, 8'd0, 32'h52414348};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
 return_state  <= S_READ_CFG;
 state         <= S_DD_WR_WAIT;
 end
+else if (qry_poll_timer < 11'd2000) begin
+qry_poll_timer <= qry_poll_timer + 11'd1;
+end
+else if (rtq_en_r) begin
+// Poll realtime query mailbox
+qry_poll_timer <= 11'd0;
+ddram_addr <= QUERY_CTRL_ADDR[24:0];
+ddram_we   <= 1'b0;
+ddram_req  <= ~ddram_req;
+return_state  <= S_RTQ_PARSE;
+state         <= S_DD_RD_WAIT;
+end
+else begin
+qry_poll_timer <= 11'd0;  // no rtquery active, skip poll
+end
 end
 
 // =============================================================
 S_DD_WR_WAIT: begin
-if (ddram_req == dd_ack_s2)
+dd_wait_cnt <= dd_wait_cnt + 20'd1;
+if (ddram_req == dd_ack_s2) begin
+dd_wait_cnt <= 20'd0;
 state <= return_state;
+end else if (&dd_wait_cnt) begin
+// Watchdog: DDRAM ack never arrived. Abort, never wedge the GBA.
+dd_wait_cnt   <= 20'd0;
+ra_clear_busy <= 1'b0;
+state         <= S_IDLE;
+end
 end
 
 // =============================================================
 S_DD_RD_WAIT: begin
+dd_wait_cnt <= dd_wait_cnt + 20'd1;
 if (ddram_req == dd_ack_s2) begin
+dd_wait_cnt <= 20'd0;
 rd_data <= ddram_dout;
 state   <= return_state;
+end else if (&dd_wait_cnt) begin
+dd_wait_cnt   <= 20'd0;
+ra_clear_busy <= 1'b0;
+state         <= S_IDLE;
 end
 end
 
@@ -217,32 +328,84 @@ end
 S_CLEAR_IWRAM: begin
     if (iwram_clear_addr == 13'd8191) begin
         iwram_clear_we  <= 4'b0000;  // done: disable BRAM writes
-        ewram_clear_cnt <= 15'd0;
-        state           <= S_CLEAR_EWRAM;
+        clear_phase     <= 1'b0;     // flash fill first (shortest race vs save load)
+        clear_cnt       <= 18'd0;
+        state           <= sdram_en ? S_CLEAR_SDR : S_CLEAR_DDR;
     end else begin
         iwram_clear_addr <= iwram_clear_addr + 13'd1;
     end
 end
 
 // =============================================================
-// CLEAR: Step 2 — iterate EWRAM in DDRAM (32768 words = 256KB)
-// Skipped when sdram_en=1 (EWRAM in SDRAM; BIOS clears on boot)
-S_CLEAR_EWRAM: begin
-    if (sdram_en) begin
-        state <= S_CLEAR_DONE;  // EWRAM in SDRAM: rely on BIOS clear
+// CLEAR: Step 2 (DDR3 mode) — flash fill 0xFF, then EWRAM zeros.
+// ddram_addr is a QWORD address; the base parameters are DWORD
+// addresses, hence the >>1 (v1 used the dword base directly and
+// clobbered ROM at byte 0x100000 instead of clearing EWRAM).
+S_CLEAR_DDR: begin
+    if (save_loading && !clear_phase) begin
+        // A save file started loading: it owns the flash region now.
+        // Abandon the 0xFF fill and move on to the EWRAM phase.
+        clear_phase <= 1'b1;
+        clear_cnt   <= 18'd0;
     end else begin
-        ddram_addr <= EWRAM_BASE_DWORD[24:0] + {10'd0, ewram_clear_cnt};
-        ddram_din  <= 64'd0;
+        ddram_addr <= (clear_phase ? {1'b0, EWRAM_BASE_DWORD[24:1]}
+                                   : {1'b0, FLASH_BASE_DWORD[24:1]}) + {7'd0, clear_cnt};
+        ddram_din  <= clear_phase ? 64'd0 : {64{1'b1}};
         ddram_be   <= 8'hFF;
         ddram_we   <= 1'b1;
         ddram_req  <= ~ddram_req;
-        if (ewram_clear_cnt == 15'd32767) begin
-            return_state <= S_CLEAR_DONE;
+        if (clear_cnt == (clear_phase ? CLR_DDR_EWRAM_LAST : CLR_DDR_FLASH_LAST)) begin
+            if (clear_phase) begin
+                return_state <= S_CLEAR_DONE;
+            end else begin
+                clear_phase  <= 1'b1;
+                clear_cnt    <= 18'd0;
+                return_state <= S_CLEAR_DDR;
+            end
         end else begin
-            ewram_clear_cnt <= ewram_clear_cnt + 15'd1;
-            return_state    <= S_CLEAR_EWRAM;
+            clear_cnt    <= clear_cnt + 18'd1;
+            return_state <= S_CLEAR_DDR;
         end
         state <= S_DD_WR_WAIT;
+    end
+end
+
+// =============================================================
+// CLEAR: Step 2 (SDRAM mode) — same regions via 16-bit ch4 writes.
+// v1 skipped this ("rely on BIOS clear") but neither the BIOS boot
+// nor the core reset clears SDRAM, so stale bytes from the previous
+// game persisted — the main source of false achievement triggers.
+S_CLEAR_SDR: begin
+    if (save_loading && !clear_phase) begin
+        // A save file started loading: it owns the flash region now.
+        clear_phase <= 1'b1;
+        clear_cnt   <= 18'd0;
+    end else begin
+        sdram_addr <= (clear_phase ? EWRAM_HW_BASE : FLASH_HW_BASE) + {8'd0, clear_cnt};
+        sdram_din  <= clear_phase ? 16'h0000 : 16'hFFFF;
+        sdram_rnw  <= 1'b0;
+        sdram_req  <= 1'b1;
+        timeout    <= 16'd0;
+        state      <= S_CLEAR_SDR_WAIT;
+    end
+end
+
+S_CLEAR_SDR_WAIT: begin
+    timeout <= timeout + 16'd1;
+    if (sdram_ready || timeout >= 16'hFFFF) begin
+        sdram_rnw <= 1'b1;
+        if (clear_cnt == (clear_phase ? CLR_SDR_EWRAM_LAST : CLR_SDR_FLASH_LAST)) begin
+            if (clear_phase) begin
+                state <= S_CLEAR_DONE;
+            end else begin
+                clear_phase <= 1'b1;
+                clear_cnt   <= 18'd0;
+                state       <= S_CLEAR_SDR;
+            end
+        end else begin
+            clear_cnt <= clear_cnt + 18'd1;
+            state     <= S_CLEAR_SDR;
+        end
     end
 end
 
@@ -265,7 +428,8 @@ end
 
 // =============================================================
 S_PARSE_CFG: begin
-    // rd_data[1] = RA_ARM_CFG_CLEAR_EN (byte 0, bit 1 of config word)
+    // rd_data[0] = RA_ARM_CFG_RTQUERY, rd_data[1] = RA_ARM_CFG_CLEAR_EN
+    rtq_en_r   <= rd_data[0];
     clear_en_r <= rd_data[1];
     state      <= S_READ_HDR;
 end
@@ -281,7 +445,8 @@ end
 
 // =============================================================
 S_PARSE_HDR: begin
-req_id <= rd_data[63:32];
+req_id    <= rd_data[63:32];
+fetch_ret <= S_STORE_VAL;
 if (rd_data[31:0] == 32'd0) begin
 req_count <= 32'd0;
 state     <= S_WRITE_RESP;
@@ -361,7 +526,7 @@ end
 end
 else begin
 fetch_byte <= 8'd0;
-state <= S_STORE_VAL;
+state <= fetch_ret;
 end
 end
 
@@ -378,7 +543,7 @@ S_IWRAM_WAIT: begin
 // BRAM registered output now valid (2 cycles after address set)
 fetch_byte <= iwram_dout;
 dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
-state <= S_STORE_VAL;
+state <= fetch_ret;
 end
 
 // =============================================================
@@ -398,11 +563,11 @@ if (sdram_ready) begin
         2'd3: fetch_byte <= sdram_dout[31:24];
     endcase
     dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
-    state <= S_STORE_VAL;
+    state <= fetch_ret;
 end else if (timeout >= 16'hFFFF) begin
     fetch_byte <= 8'd0;
     dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;
-    state <= S_STORE_VAL;
+    state <= fetch_ret;
 end
 end
 
@@ -418,7 +583,7 @@ case (byte_sel)
 3'd6: fetch_byte <= rd_data[55:48];
 3'd7: fetch_byte <= rd_data[63:56];
 endcase
-state <= S_STORE_VAL;
+state <= fetch_ret;
 end
 
 // =============================================================
@@ -486,7 +651,7 @@ end
 // =============================================================
 S_WR_HDR0: begin
 ddram_addr <= DDRAM_BASE[24:0];
-ddram_din  <= {16'h0100, 8'h00, 8'd0, 32'h52414348};
+ddram_din  <= {16'h0200, 8'h00, 8'd0, 32'h52414348};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
@@ -511,7 +676,7 @@ end
 // =============================================================
 S_WR_DBG: begin
 ddram_addr <= DDRAM_BASE[24:0] + 25'd2;
-ddram_din  <= {8'h01, dbg_dispatch_cnt, 16'd0, dbg_timeout_cnt, dbg_ok_cnt};
+ddram_din  <= {8'h02, dbg_dispatch_cnt, 16'd0, dbg_timeout_cnt, dbg_ok_cnt};
 ddram_be   <= 8'hFF;
 ddram_we   <= 1'b1;
 ddram_req  <= ~ddram_req;
@@ -530,22 +695,94 @@ return_state  <= S_IDLE;
 state         <= S_DD_WR_WAIT;
 end
 
+// =============================================================
+// Realtime Query States (v2)
+// =============================================================
+S_RTQ_PARSE: begin
+// ctrl word: [7:0]=request_seq [15:8]=num_queries [39:32]=response_seq
+if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
+    qry_request_seq <= rd_data[7:0];
+    qry_num         <= (rd_data[15:8] > MAX_RT_QUERIES) ? MAX_RT_QUERIES : rd_data[15:8];
+    qry_idx         <= 4'd0;
+    state           <= S_RTQ_RD_REQ;
+end else begin
+    state <= S_IDLE;
+end
+end
+
+S_RTQ_RD_REQ: begin
+ddram_addr <= QUERY_REQ_BASE[24:0] + {21'd0, qry_idx};
+ddram_we   <= 1'b0;
+ddram_req  <= ~ddram_req;
+return_state  <= S_RTQ_REQ_PARSE;
+state         <= S_DD_RD_WAIT;
+end
+
+S_RTQ_REQ_PARSE: begin
+// req slot: [31:0]=address [39:32]=num_bytes (1-4)
+cur_addr      <= rd_data[31:0];
+qry_num_bytes <= (rd_data[39:32] == 8'd0 || rd_data[39:32] > 8'd4) ? 3'd1 : rd_data[34:32];
+qry_value     <= 32'd0;
+qry_byte_idx  <= 3'd0;
+fetch_ret     <= S_RTQ_STORE;
+state         <= S_DISPATCH;
+end
+
+S_RTQ_STORE: begin
+qry_value    <= qry_value | ({24'd0, fetch_byte} << {qry_byte_idx, 3'b000});
+qry_byte_idx <= qry_byte_idx + 3'd1;
+if (qry_byte_idx + 3'd1 >= qry_num_bytes) begin
+    state <= S_RTQ_WR_RESP;
+end else begin
+    cur_addr <= cur_addr + 32'd1;
+    state    <= S_DISPATCH;
+end
+end
+
+S_RTQ_WR_RESP: begin
+ddram_addr <= QUERY_RESP_BASE[24:0] + {21'd0, qry_idx};
+ddram_din  <= {32'd0, qry_value};
+ddram_be   <= 8'hFF;
+ddram_we   <= 1'b1;
+ddram_req  <= ~ddram_req;
+qry_idx    <= qry_idx + 4'd1;
+if ({1'b0, qry_idx} + 5'd1 >= qry_num[4:0]) begin
+    return_state <= S_RTQ_WR_CTRL;
+end else begin
+    return_state <= S_RTQ_RD_REQ;
+end
+state <= S_DD_WR_WAIT;
+end
+
+S_RTQ_WR_CTRL: begin
+// Commit: response_seq (byte 4) = request_seq. Full-qword write also
+// restores request_seq/num so the ARM's next read sees a coherent word.
+qry_last_seen_seq <= qry_request_seq;
+ddram_addr <= QUERY_CTRL_ADDR[24:0];
+ddram_din  <= {24'd0, qry_request_seq, 16'd0, qry_num, qry_request_seq};
+ddram_be   <= 8'hFF;
+ddram_we   <= 1'b1;
+ddram_req  <= ~ddram_req;
+return_state  <= S_IDLE;
+state         <= S_DD_WR_WAIT;
+end
+
 default: state <= S_IDLE;
 endcase
 end
 end
 
 // ======================================================================
-// Edge detection: triggers IWRAM+EWRAM clear sequence on cart_download fall
+// Edge detection: triggers IWRAM+EWRAM/flash clear on cart_download fall
 // cart_dl_prev always tracks cart_download (not gated by reset) so the
 // falling edge is detected even after reset deasserts.
-// clear_trigger is a 1-cycle pulse consumed by the main state machine.
+// clear_trigger is a 1-cycle pulse latched into clear_pending above.
 // NOTE: ra_mirror reset does NOT include ra_clear_busy (see GBA.sv).
 //       GBA_on uses gba_clear_reset = reset | ra_clear_busy instead.
 // ======================================================================
 always @(posedge clk) begin
     cart_dl_prev <= cart_download;  // Track regardless of reset
-    if (reset) begin
+    if (reset && !ra_clear_busy) begin
         clear_trigger <= 1'b0;
     end else begin
         // One-cycle pulse: cart_download 1→0 AND clear enabled

@@ -274,11 +274,11 @@ parameter CONF_STR = {
 	"P3-;",
 	"P3O[15:14],Storage,Auto,SDRAM,DDR3;",
 	"D5P3O[5],Pause when OSD is open,Off,On;",
-	"P3O[27],Rewind Capture,Off,On;",
+	"H7P3O[27],Rewind Capture,Off,On;",
 	"P3-;",
 	"P3-,Only Romhacks or Crash!;",
 	"P3O[40],GPIO HACK(RTC+Rumble),Off,On;",
-	"P3O[42:41],Underclock CPU,0,1,2,3;",
+	"H7P3O[42:41],Underclock CPU,0,1,2,3;",
 
 	"- ;",
 	"R0,Reset;",
@@ -560,7 +560,7 @@ gba
 	.GBA_cputurbo(cpu_turbo),
 	.GBA_flash_1m(flash_1m),          // 1 when string "FLASH1M_V" is anywhere in gamepak
 	.CyclePrecalc(pause ? 16'd0 : 16'd100), // 100 seems to be ok to keep fullspeed for all games
-	.Underclock(status[42:41]),
+	.Underclock(hardcore ? 2'd0 : status[42:41]), // slow-motion = cheat vector in hardcore
    .MaxPakAddr(last_addr[26:2]),     // max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
 	.CyclesMissing(),                 // debug only for speed measurement, keep open
 	.CyclesVsyncSpeed(),              // debug only for speed measurement, keep open
@@ -827,7 +827,9 @@ sdram sdram
 
 	.ch4_addr(ra_sdram_addr),
 	.ch4_dout(ra_sdram_dout),
+	.ch4_din(ra_sdram_din),
 	.ch4_req(ra_sdram_req),
+	.ch4_rnw(ra_sdram_rnw),
 	.ch4_ready(ra_sdram_ready)
 );
 
@@ -904,6 +906,8 @@ ra_ram_mirror_gba ra_mirror(
         .sdram_en(sdram_en),
 
         .sdram_addr(ra_sdram_addr),
+        .sdram_din(ra_sdram_din),
+        .sdram_rnw(ra_sdram_rnw),
         .sdram_req(ra_sdram_req),
         .sdram_dout(ra_sdram_dout),
         .sdram_ready(ra_sdram_ready),
@@ -912,6 +916,7 @@ ra_ram_mirror_gba ra_mirror(
         .iwram_dout(ra_iwram_data),
         .iwram_we(ra_iwram_we),
         .cart_download(cart_download),
+        .save_loading(bk_loading),
         .ra_clear_busy(ra_clear_busy),
         .iwram_clear_addr(ra_iwram_clear_addr),
         .iwram_clear_we(ra_iwram_clear_we),
@@ -1541,6 +1546,8 @@ wire [12:0] ra_iwram_clear_addr;
 wire  [3:0] ra_iwram_clear_we;
 wire        ra_clear_busy;
 wire [26:1] ra_sdram_addr;
+wire [15:0] ra_sdram_din;
+wire        ra_sdram_rnw;
 wire        ra_sdram_req;
 wire [31:0] ra_sdram_dout;
 wire        ra_sdram_ready;

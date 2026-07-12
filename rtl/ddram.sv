@@ -89,6 +89,7 @@ reg  [7:0] ram_be;
 
 reg  [5:1] ready;
 reg        ra_rd_pending = 0;
+reg [63:0] ra_q;
 
 assign DDRAM_BURSTCNT = ram_burst;
 assign DDRAM_BE       = ram_read ? 8'hFF : ram_be;
@@ -106,7 +107,7 @@ assign ch2_ready = ready[2];
 assign ch3_ready = ready[3];
 assign ch4_ready = ready[4];
 assign ch5_ready = ready[5];
-assign ra_dout   = ram_q[1];
+assign ra_dout   = ra_q;
 
 reg [63:0] next_q[2:1];
 reg [27:1] cache_addr[2:1];
@@ -245,24 +246,26 @@ always @(posedge DDRAM_CLK) begin
 						ram_write     <= 1;
 						ram_burst     <= 1;
 						ra_ack        <= ra_req;
+						// Game-load clear writes below the RA mirror region can
+						// alias data held in the ch1/ch2 read caches.
+						if (ra_addr < 25'h1A00000) cached <= 0;
 					end else begin
-						ch            <= 1;
 						ram_address   <= {ra_addr, 2'b00};
 						ram_read      <= 1;
 						ram_burst     <= 1;
 						ra_rd_pending <= 1;
-						cached[1]     <= 0;
 						state         <= 1;
 					end
 				end
 
 			1: if(DDRAM_DOUT_READY) begin
-					ram_q[ch]        <= DDRAM_DOUT;
 					if (ra_rd_pending) begin
+						ra_q          <= DDRAM_DOUT;
 						ra_ack        <= ra_req;
 						ra_rd_pending <= 0;
 						state         <= 0;
 					end else begin
+						ram_q[ch]     <= DDRAM_DOUT;
 						ready[ch]     <= 1;
 						state         <= {ram_burst[1], 1'b0};
 					end
