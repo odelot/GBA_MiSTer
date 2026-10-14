@@ -85,13 +85,15 @@ localparam [31:0] EWRAM_END = 32'h48000;
 localparam [31:0] CART_END  = 32'h58000;
 
 // Clear geometry.
-// DDR3 (qword writes):  flash 128KB = 16384 qwords @ qword(FLASH_BASE_DWORD/2)
+// Save memory is 1 byte per dword, so 128KB of flash spans 512KB
+// (dwords 0..131071, right below EWRAM at dword 131072).
+// DDR3 (qword writes):  flash 128KB = 65536 qwords @ qword(FLASH_BASE_DWORD/2)
 //                       EWRAM 256KB = 32768 qwords @ qword(EWRAM_BASE_DWORD/2)
-// SDRAM (16-bit writes): flash 128KB = 65536 halfwords @ hw 0
+// SDRAM (16-bit writes): flash 128KB = 262144 halfwords @ hw 0
 //                        EWRAM 256KB = 131072 halfwords @ hw 0x40000
-localparam [17:0] CLR_DDR_FLASH_LAST  = 18'd16383;
+localparam [17:0] CLR_DDR_FLASH_LAST  = 18'd65535;
 localparam [17:0] CLR_DDR_EWRAM_LAST  = 18'd32767;
-localparam [17:0] CLR_SDR_FLASH_LAST  = 18'd65535;
+localparam [17:0] CLR_SDR_FLASH_LAST  = 18'd262143;
 localparam [17:0] CLR_SDR_EWRAM_LAST  = 18'd131071;
 localparam [25:0] EWRAM_HW_BASE       = {EWRAM_BASE_DWORD, 1'b0};
 localparam [25:0] FLASH_HW_BASE       = {FLASH_BASE_DWORD, 1'b0};
@@ -202,11 +204,17 @@ reg [10:0] qry_poll_timer;
 wire [31:0] ewram_offset = cur_addr - 32'h8000;
 wire [31:0] cart_offset  = cur_addr - 32'h48000;
 
+// EWRAM is packed (4 bytes per dword). Save memory (SRAM/Flash/EEPROM) is
+// NOT: the core bus uses dword addresses for it and keeps save byte N in
+// the low byte of dword N (memorymux reads bus_out_Dout(7:0); the .sav
+// loader writes the same stride via sdram.sv/ddram.sv ch3). So cart byte
+// N is dword FLASH_BASE_DWORD+N, byte 0.
 wire [24:0] ewram_dword = EWRAM_BASE_DWORD + {7'd0, ewram_offset[17:2]};
-wire [24:0] cart_dword  = FLASH_BASE_DWORD  + {9'd0, cart_offset[15:2]};
+wire [24:0] cart_dword  = FLASH_BASE_DWORD  + {9'd0, cart_offset[15:0]};
 
 // DDRAM 25-bit address: {1'b0, dword_addr[24:1]} (ddram.sv adds 4'b0011 prefix)
-// byte_sel = offset[2:0] (works because base dword addrs are even)
+// EWRAM byte_sel = offset[2:0] (works because base dword addrs are even)
+// Cart  byte_sel = {cart_dword[0], 2'b00} (low byte of the selected dword)
 
 // ======================================================================
 // Main state machine
@@ -511,12 +519,12 @@ end
 else if (cur_addr < CART_END) begin
 dbg_cart_cnt <= dbg_cart_cnt + 16'd1;
 if (sdram_en) begin
-    byte_sel  <= {1'b0, cart_offset[1:0]};
+    byte_sel  <= 3'd0;
     sdram_addr <= {cart_dword, 1'b0};
     sdram_req  <= 1'b1;
     state      <= S_FETCH_SDR;
 end else begin
-    byte_sel <= cart_offset[2:0];
+    byte_sel <= {cart_dword[0], 2'b00};
     ddram_addr <= {1'b0, cart_dword[24:1]};
     ddram_we   <= 1'b0;
     ddram_req  <= ~ddram_req;
