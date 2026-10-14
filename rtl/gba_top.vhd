@@ -143,7 +143,8 @@ entity gba_top is
       ra_iwram_data         : out    std_logic_vector(7 downto 0);
       ra_iwram_we           : out    std_logic_vector(0 to 3);
       ra_clear_addr         : in     std_logic_vector(12 downto 0) := (others => '0');
-      ra_clear_we_in        : in     std_logic_vector(0 to 3)       := (others => '0')
+      ra_clear_we_in        : in     std_logic_vector(0 to 3)       := (others => '0');
+      ra_vblank             : out    std_logic                                          -- 1-cycle pulse on entering line 160
    );
 end entity;
 
@@ -384,7 +385,11 @@ architecture arch of gba_top is
    signal current_frame    : integer range 0 to 2 := 0;
    signal frameoffset      : integer range 0 to 2 := 0;
    
-begin 
+begin
+
+   -- RetroAchievements snapshot point: VBlank start (line 160), where mGBA
+   -- and RAVBA evaluate a frame, before the VBlank IRQ handler runs.
+   ra_vblank <= vblank_trigger;
 
    -- dummy modules
    igba_reservedregs : entity work.gba_reservedregs port map ( clk100, gb_bus);

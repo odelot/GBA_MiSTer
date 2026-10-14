@@ -659,7 +659,8 @@ gba
 	.ra_iwram_data(ra_iwram_data),
 	.ra_iwram_we(ra_iwram_we),
 	.ra_clear_addr(ra_iwram_clear_addr),
-	.ra_clear_we_in(ra_iwram_clear_we)
+	.ra_clear_we_in(ra_iwram_clear_we),
+	.ra_vblank(ra_vblank)
 );
 
 assign AUDIO_L = (fast_forward && status[19]) ? 16'd0 : GBA_AUDIO_L;
@@ -902,7 +903,7 @@ ddram ddram
 ra_ram_mirror_gba ra_mirror(
         .clk(clk_sys),
         .reset(reset),
-        .vblank(vsync),
+        .vblank(ra_vblank),   // GBA VBlank start (line 160), not the video vsync at line 0
         .sdram_en(sdram_en),
 
         .sdram_addr(ra_sdram_addr),
@@ -1545,6 +1546,7 @@ wire  [3:0] ra_iwram_we;
 wire [12:0] ra_iwram_clear_addr;
 wire  [3:0] ra_iwram_clear_we;
 wire        ra_clear_busy;
+wire        ra_vblank;
 wire [26:1] ra_sdram_addr;
 wire [15:0] ra_sdram_din;
 wire        ra_sdram_rnw;
